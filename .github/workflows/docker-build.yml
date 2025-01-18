@@ -12,13 +12,27 @@ jobs:
   check:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v2
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Fetch all history to compare changes
 
-    - name: Check Dockerfile changes
-      run: scripts/check_dockerfile_changes.sh
+      - name: Check related file modifications
+        run: |
+          # Get changed files in PR
+          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }} origin/${{ github.head_ref }})
+          
+          # Check if Dockerfile was modified
+          if echo "$CHANGED_FILES" | grep -q "Dockerfile"; then
+            # If Dockerfile changed, check if test.sh also changed
+            if ! echo "$CHANGED_FILES" | grep -q "test.sh"; then
+              echo "Error: Changes to Dockerfile detected but test.sh was not modified"
+              echo "Please update test.sh to reflect Dockerfile changes"
+              exit 1
+            fi
+          fi
+          
+          echo "All required files are properly modified"
 
   build:
     if: github.event_name == 'push'
@@ -54,8 +68,8 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v2
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v1
+    # - name: Set up Docker Buildx
+    #   uses: docker/setup-buildx-action@v1
 
     - name: Build Docker image
       uses: docker/build-push-action@v2
@@ -63,12 +77,106 @@ jobs:
         context: .
         file: Dockerfile
         push: false
-        tags: ghcr.io/${{ github.repository }}/homelab-utils:pr-${{ github.event.number }}
+        tags: homelab-utils:${{ github.sha }}
 
-    - name: Scan Docker image with Trivy
+    # Run Trivy container scan
+    - name: Run Trivy container scan
       uses: aquasecurity/trivy-action@master
       with:
-        image-ref: ghcr.io/${{ github.repository }}/homelab-utils:pr-${{ github.event.number }}
+        image-ref: 'homelab-utils:${{ github.sha }}'
+        format: 'sarif'
+        output: 'trivy-container-results.sarif'
+        severity: 'CRITICAL,HIGH'
+
+    # Run Trivy filesystem scan
+    - name: Run Trivy filesystem scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        format: 'sarif'
+        output: 'trivy-fs-results.sarif'
+        severity: 'CRITICAL,HIGH'
+
+    # Run dependency check
+    - name: Run dependency check
+      uses: snyk/actions/node@master
+      continue-on-error: true
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        args: --severity-threshold=high
+
+    # Generate formatted report
+    - name: Generate security report
+      id: report
+      run: |
+        echo "## Security Scan Results :shield:" > security-report.md
+        echo "### Vulnerabilities Found" >> security-report.md
+        echo "\`\`\`" >> security-report.md
+        
+        # Add Docker image scan results
+        echo "DOCKER IMAGE SCAN FINDINGS:" >> security-report.md
+        trivy image --severity HIGH,CRITICAL --format table homelab-utils:${{ github.sha }} >> security-report.md
+        
+        # Add filesystem scan results
+        echo "FILESYSTEM SCAN FINDINGS:" >> security-report.md
+        trivy filesystem --severity HIGH,CRITICAL --format table . >> security-report.md
+        
+        # Add Snyk results if available
+        if [ -f snyk-results.json ]; then
+          echo "DEPENDENCY SCAN FINDINGS:" >> security-report.md
+          jq -r '.vulnerabilities[] | "- " + .title + " (Severity: " + .severity + ")"' snyk-results.json >> security-report.md
+        fi
+        
+        echo "\`\`\`" >> security-report.md
+
+    # Post results to PR
+    - name: Comment PR
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const report = fs.readFileSync('security-report.md', 'utf8');
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: report
+          });
+
+    # Upload SARIF results for both scans
+    - name: Upload Container Scan SARIF
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-container-results.sarif'
+        category: 'trivy-container'
+
+    - name: Upload Filesystem Scan SARIF
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-fs-results.sarif'
+        category: 'trivy-fs'
+
+    # Create PR check
+    - name: Create Check Run
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const report = fs.readFileSync('security-report.md', 'utf8');
+          
+          await github.rest.checks.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            name: 'Security Scan Results',
+            head_sha: context.sha,
+            status: 'completed',
+            conclusion: '${{ steps.scan.outcome }}',
+            output: {
+              title: 'Security Scan Complete',
+              summary: report
+            }
+          });
 
   test:
     if: github.event_name == 'pull_request'
@@ -79,8 +187,8 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v2
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v1
+    # - name: Set up Docker Buildx
+    #   uses: docker/setup-buildx-action@v1
 
     - name: Build Docker image
       uses: docker/build-push-action@v2
@@ -90,5 +198,8 @@ jobs:
         push: false
         tags: homelab-utils:test
 
+    - name: Set execute permissions for test_docker_image.sh
+      run: chmod +x tests/test_docker_image.sh
+
     - name: Run tests
-      run: docker run --rm -v $(pwd)/scripts:/scripts homelab-utils:test /scripts/test_docker_image.sh
+      run: docker run --rm -v $(pwd)/tests:/tests homelab-utils:test /tests/test_docker_image.sh
